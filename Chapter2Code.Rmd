@@ -1,0 +1,1770 @@
+---
+title: "Chapter2Code"
+author: "Reilly Brennan"
+date: "2025-07-15"
+output:
+  html_document: default
+  pdf_document: default
+---
+##Start: Load Packages
+```{r setup, include=FALSE}
+##Phylogenetics and Sequence Analysis
+library(adephylo)
+library(ape)
+library(Biostrings)
+library(ggtree)
+library(msa)
+library(muscle)
+library(microseq)
+library(phangorn)
+library(phylobase)
+library(phyloraster)
+library(phylotools)
+library(phytools)
+library(pegas)
+library(seqinr)
+library(tidytree)
+library(treeio)
+
+##Spatial Data and Mapping
+library(geodata)
+library(geosphere)
+library(raster)
+library(rnaturalearth)
+library(sf)
+library(sp)
+library(spatialEco)
+library(spatstat.explore)
+library(spatstat.geom)
+library(stars)
+library(terra)
+library(tidyterra)
+
+##Data Manipulation and Visualization
+library(anticlust)
+library(ash)
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(latexpdf)
+library(magrittr)
+library(reshape2)
+library(stringr)
+library(tidyverse)
+library(ggcorrplot)
+
+
+## Biodiversity and occurence data
+library(CoordinateCleaner)
+library(countrycode)
+library(gbif.range)
+library(readr)
+library(rgbif)
+```
+
+
+##Part 1. Parasite Species Richness###
+
+Load Data:
+- Read in csv with records of parasites from literature review 
+- Create coordinate object with each record and then buffer with 0.5 degrees around each point
+- Sort by unique records to take a look at the list 
+```{r}
+par<- read.csv("ColiPar.csv", header=TRUE) #has coordinates lat/long for olivacea sequences (all, cytb and other)
+  wgscoor<- par
+  coordinates(wgscoor) <- ~Longitude + Latitude
+  proj4string(wgscoor)<- CRS("+proj=longlat +datum=WGS84")
+  raster::shapefile(wgscoor, "ColiPar.shp", overwrite=T)
+  
+ #->buffered in qGIS and imported below (0.5 degrees)
+  
+sort(unique(par$Parasite))
+```
+Import buffered file of parasite points and use phyloraster package to consider species richness
+```{r}
+coli_par <- terra::vect("./ColiParBuff/ColiParBuff.shp")
+
+r2_colipar <- shp2rast(coli_par, sps.col = "Parasite", ymask = FALSE, background = 0, 
+             resolution = 0.5) # convert to raster with phyloraster
+layer_colipar<- as.data.frame(r2_colipar, xy= T) #create df with raster data
+srcoli<- rast.sr(x=r2_colipar) #calculate species richness using phyloraster function
+```
+Create S. America for map overlay
+```{r}
+Chile<- read_sf("./CHL_adm/CHL_adm0.shp")
+Argentina <-read_sf("./ARG_adm/ARG_adm0.shp")
+SA <- st_union(Chile, Argentina)
+```
+Match the parasite species richness raster to the extent and resolution of South America
+```{r}
+test2_par <- terra::crop(srcoli, SA)
+
+ext <- floor(ext(SA))
+nr <- rast(ext, res = res(srcoli))
+values(nr) <- 0
+testnew <- terra::mask(nr,SA)
+
+tn_ras<-rast(testnew)
+t2_ras<-rast(test2_par)
+
+res(tn_ras) <- 0.5
+res(t2_ras)<-0.5
+crs(t2_ras)<-crs(tn_ras)
+testnew<- resample(testnew, tn_ras)
+test2_par<-resample(test2_par, t2_ras)
+plot(test2_par)
+plot_par <- mosaic(test2_par, testnew, fun="max")
+srSA <- terra::mask(plot_par,SA)
+```
+ggplot map for parasite richness
+```{r}
+par_plot_df<- as.data.frame(srSA, xy=TRUE)
+par_plot<- subset(par_plot_df, SR!=0)
+par_zero<- subset(par_plot_df, SR==0)
+
+xlim<-c(-80, -50)
+ylim<-c(-60, -15)
+
+parmap <- ggplot(data = par_plot) +
+    geom_raster(aes(x = x, y = y, fill = `SR`)) +
+    scale_fill_gradientn(colours = c("#fada5fff", "orange","darkorange","darkorange", "#aa0000", "red4"),
+                       breaks = c(1,2,3,4,5,6,7,8,9,10),
+                       labels= c("1", "2", "3", "4", "5", "6", "7", "8","9","10"))+
+    geom_raster(data=par_zero, aes(x = x, y = y), show.legend = F)+
+   ggtitle(expression(paste(bold("Parasite Species Richness of"), bolditalic (" O. longicaudatus")))) +
+   theme(legend.position = "right",legend.box.spacing = unit(0, "pt"), panel.background = element_rect(fill = "white"),
+        panel.grid = element_line(color = "gray94"), plot.title = element_text(hjust = 0.5, size=10),
+        axis.title = element_text(face="bold")
+        ) +
+    coord_sf(xlim=xlim, ylim=ylim) +
+  labs(x="Longitude", y= "Latitude") 
+parmap
+```
+Make data frame of parasite species richness for data analysis
+```{r}
+dfa<- as.data.frame(srcoli, xy=T)
+```
+
+
+
+
+##Part 2. ANDV Phylogeny 
+
+###Phylogenetic Tree Building- This can be skipped as the .tree file is provided. However, a new tree can be built. The ML algorithm may find a tree slightly different than the one provided in the .tree file, but it won't significantly change the results.
+
+Load the sequence file ANDV.fasta and explore the sequences:
+```{r}
+fa_andv <- readDNAStringSet("ANDV.fasta")
+len <- seqlengths(fa_andv)
+len<-as.data.frame(len)
+min(len$len)
+max(len$len)
+##function we will use throughout ##
+alignment2Fasta <- function(alignment, filename) {
+  sink(filename)
+  
+  n <- length(rownames(alignment))
+  for(i in seq(1, n)) {
+    cat(paste0('>', rownames(alignment)[i]))
+    cat('\n')
+    the.sequence <- toString(unmasked(alignment)[[i]])
+    cat(the.sequence)
+    cat('\n')  
+  }
+  
+  sink(NULL)
+}
+```
+Align the sequences. The msa package works with ClustalW, ClustalOmega, and MUSCLE alignment algorithms. Save the alignment
+Trim the alignment and convert it to DNAbin object
+```{r, eval=FALSE}
+seqs_andv<- readDNAStringSet("ANDV.fasta")#fasta file classssic format with about 180 cytb seqs
+
+align_andv<- msaMuscle(seqs_andv) #align sequences, there are different parameters here that can be changed but i am using the default for clustalw
+
+alignment2Fasta(align_andv, 'alignmentANDV_may7.fasta') #my function
+
+aligned_andv<- readFasta('alignmentANDV_may7.fasta')
+trimANDV_align<- msaTrim(aligned_andv, gap.end = 0.1, gap.mid = 0.9)
+trimANDV_align <- msa2mat(trimANDV_align)  # for use with ape::as.DNAbin(msa.mat)
+trimANDV_align<- ape::as.DNAbin(trimANDV_align)
+
+```
+
+Create phydat, and test models of substitution. Build Phylogenetic Tree. Save tree.
+```{r, eval=FALSE}
+andv_dat<-as.phyDat(trimANDV_align)
+
+andvmodels<- modelTest(andv_dat)
+
+fit_andv<- pml_bb(andvmodels, control = pml.control(trace = 0), rearrangements="stochastic")
+
+bs_andv <- bootstrap.pml(fit_andv, bs=1000, optNni=TRUE,trees=TRUE,
+                   control = pml.control(trace = 0))
+
+plotBS(midpoint(fit_andv$tree), p = .5, type="p", digits=2, main="Ultrafast bootstrap")
+
+plotBS(midpoint(fit_andv$tree), bs, p = 50, type="p", main="Standard bootstrap")
+
+plotBS(midpoint(fit_andv$tree), bs, p = 50, type="p", digits=0, method = "TBE", main="Transfer bootstrap")
+treeandv<- fit_andv$tree
+plot(fit_andv$tree)
+plot(treeandv)
+
+treebs_andv<-plotBS(fit_andv$tree, bs_andv, type= "n")
+plot(treebs_andv)
+write.tree(treebs_andv, "ANDVTree_BS.tree")
+```
+
+###Calculating Phylogenetic Richness in Geographic Space
+Get shapefile with points for each data from occurence matrix 
+```{r}
+andv_points<- read.csv("ColilargoANDVdata.csv", header=TRUE) #has coordinates lat/long for cytb coli
+andv_points[is.na(andv_points)] <- 0
+wgscoor<-andv_points
+coordinates(wgscoor) <- ~ Longitude+ Latitude
+proj4string(wgscoor)<- CRS("+proj=longlat +datum=WGS84")
+raster::shapefile(wgscoor, "ANDV.shp", overwrite=T)
+#buffered in qGIS and imported below (0.5 degrees)
+```
+
+Phylo geo map just to take a fun look at where the ANDV seqs are coming from 
+```{r}
+treeandv<-read.tree("ANDVTree_BS.tree")
+tipsandv<- read.csv("andvtips.csv", header=TRUE) # a table to change the tip labels so they will match the shp file 
+pos_id <-match(treeandv$tip.label,tipsandv$old ) #element position
+
+treeandv$tip.label <- tipsandv$new[pos_id]
+
+plot(treeandv)
+
+
+andv_points<- read.csv("ColilargoANDVdata.csv", header=TRUE)
+
+andv_coords<-data.frame(tip= c(andv_points$Accession),
+                        lat= c(andv_points$Latitude),
+                        lon= c(andv_points$Longitude))
+row.names(andv_coords)<- andv_coords$tip
+andv_coords$tip<-NULL
+
+map_andv<- phylo.to.map(treeandv,andv_coords, rotate= T, plot=F,
+                        direction="rightwards",regions="Chile")
+
+xlim<-c(-80, -50)
+ylim<-c(-60, -15)
+plot(map_andv,direction="rightwards",pts=FALSE,
+    xlim=xlim,ylim=ylim,ftype="i",
+    fsize=0.8,map.bg="lightgreen",
+    colors="slategrey")
+title( main= "ANDV Phylogeny",line=-2 ,cex.main = 2,   font.main= 4)
+```
+
+Import the buffered points, calculate phylogenetic diversity of ANDV
+```{r warning=F}
+shpandv <- terra::vect("ANDVbuff/ANDVbuff.shp") # collection points with buffers 
+r2ANDV <- shp2rast(shpandv,sps.col = "Accession", ymask = FALSE, background = 0, resolution =0.5) # turn shp to raster with phyloraster function
+
+treeandv<- read.tree("ANDVTree_BS.tree") #load phylogenetic tree
+tipsandv<- read.csv("andvtips.csv", header=TRUE) # a table to change the tip labels so they will match the shp file 
+
+pos_id_andv <-match(treeandv$tip.label,tipsandv$old ) #element position
+treeandv$tip.label <- tipsandv$new[pos_id_andv]
+
+dataprep_andv<- phylo.pres(x=r2ANDV, tree=treeandv, pruning= "tree") # take the data points for which their is phylo and shp. data
+pdr_andv <- rast.pd(x = dataprep_andv$x, edge.path = dataprep_andv$edge.path, 
+               branch.length = dataprep_andv$branch.length) # get phlyo diversity with function from phyloraster
+```
+
+Normalize pd values by number of individuals
+```{r}
+#create df from raster layer 
+layer_andv<- as.data.frame(r2ANDV, xy=T)
+
+#create df from PD values
+dfandv_coli<- as.data.frame(pdr_andv$PD, xy=T)
+colnames(dfandv_coli)[3]<-"PDandv"
+
+#merge and divide PD by # of individuals
+seqANDV<- merge(dfandv_coli, layer_andv, by=c("x", "y"))
+seqandv_sum<-seqANDV
+seqandv_sum$SeqSum <- rowSums(seqandv_sum[,4:33] )
+seqANDV$PDandv<- seqandv_sum$PDandv/seqandv_sum$SeqSum
+
+
+seqANDV[is.na(seqANDV)]<-0
+PD_ANDV<- data.frame(seqANDV[1:3])
+r_PDandv<- rast(PD_ANDV, type="xyz")
+plot(r_PDandv)
+```
+
+Phylogenetic diversity of ANDV Map
+```{r}
+test2 <- terra::crop(r_PDandv$PDandv, SA)
+ext <- floor(ext(SA))
+nr <- rast(ext, res = res(r_PDandv$PDandv))
+values(nr) <- 0
+testnew <- terra::mask(nr,SA)
+
+tn_ras<-rast(testnew)
+t2_ras<-rast(test2)
+
+res(tn_ras) <- 0.5
+res(t2_ras)<-0.5
+crs(t2_ras)<-crs(tn_ras)
+testnew<- resample(testnew, tn_ras)
+test2<-resample(test2, t2_ras)
+plot(test2)
+plot<- terra::mosaic(test2,testnew, fun="max")
+
+PDplot_andv <- terra::mask(plot,SA)
+color<-colorRampPalette(c("darkgray", "#fada5fff", "gold", "orange","darkorange2" ,"#aa0000")) 
+plot(PDplot_andv,
+     main= "ANDV Phylogenetic Diversity", ext=c(-80, -50, -60, -15), xlab="Longitude", ylab="Latitude",
+     col=color(30))
+```
+
+Phylogenetic diversity of ANDV Map GGPLOT
+```{r}
+andv_plot_df<- as.data.frame(PDplot_andv, xy=TRUE)
+andv_plot<- subset(andv_plot_df, PDandv!=0)
+andv_zero<- subset(andv_plot_df, PDandv==0)
+
+xlim<-c(-80, -50)
+ylim<-c(-60, -15)
+
+andvmap<-ggplot(data = andv_plot) +
+    geom_raster(aes(x = x, y = y, fill = `PDandv`)) +
+    scale_fill_gradientn(colours = c("#fada5fff", "orange","darkorange2","#aa0000", "red4"),
+                       breaks = c(0.05, 0.1, 0.15, 0.2,  max(andv_plot$PDandv)),
+                       labels= c( "0.05","0.1","0.15","0.2", "0.22"))+
+    geom_raster(data=andv_zero, aes(x = x, y = y), show.legend = F)+
+    theme(legend.position = "right",legend.box.spacing = unit(0, "pt"), panel.background = element_rect(fill = "white"),
+        panel.grid = element_line(color = "gray94"),
+        axis.title = element_text(face="bold"),
+        plot.title = element_text(hjust = 0.5, size=10)) +
+    coord_sf(xlim=xlim, ylim=ylim) +
+  labs(x="Longitude", y= "Latitude")+
+    ggtitle(expression(paste(bold("Phylogenetic Richness of ANDV"))))
+andvmap
+```
+
+
+
+
+
+##Part 3. Colilargo Phylo
+
+###Phylogenetic Tree Building- This can be skipped as the .tree file is provided. However, a new tree can be built. The ML algorithm may find a tree slightly different than the one provided in the .tree file, but it won't significantly change the results.
+Align the sequences. The msa package works with ClustalW, ClustalOmega, and MUSCLE alignment algorithms. Here I am using MUSCLE.
+```{r, eval=FALSE}
+seqs_coli<- readDNAStringSet("CytBColi_4-22.fasta") 
+align_coli<- msaMuscle(seqs_coli) #align sequences, there are different parameters here that can be changed but i am using the default for clustalw
+alignment2Fasta(align_coli, 'alignment_july.fasta') #my function
+aligned<- readFasta('alignment_july.fasta')
+trim_align<- msaTrim(aligned, gap.end = 0.1, gap.mid = 0.9)
+```
+
+Build Phylogenetic Tree
+```{r, eval=FALSE}
+#convert data type
+trim_align <- msa2mat(trim_align)  # for use with ape::as.DNAbin(msa.mat)
+trim_align<- ape::as.DNAbin(trim_align)
+colidat<-as.phyDat(trim_align)
+
+#model testing
+colimodels<- modelTest(colidat)
+#model fit
+fit_coli <- pml_bb(colimodels, control = pml.control(trace = 0))
+#bootstrap
+bs_coli <- bootstrap.pml(fit_coli, bs=1000, optNni=TRUE,trees=TRUE,
+                   control = pml.control(trace = 0))
+
+treebs<-plotBS(fit_coli$tree, bs_coli, type= "n",p=0.5)
+plot(treebs)
+plotBS(midpoint(fit_coli$tree), p = .5, type="p", digits=2, main="Ultrafast bootstrap")
+
+plotBS(midpoint(fit_coli$tree), bs, p = 50, type="p", main="Standard bootstrap")
+
+plotBS(midpoint(fit_coli$tree), bs, p = 50, type="p", digits=0, method = "TBE", main="Transfer bootstrap")
+
+plotBS(midpoint(fit_coli$tree), bs_coli, p = 50, type="p", main="Standard bootstrap")
+
+write.tree(treebs, "ColiTreeJuly_bs.tree")
+write.tree(fit_coli$tree,"ColiTreeJuly.tree" )
+```
+
+###Calculating Phylogenetic Richness in Geographic Space
+
+Get shapefile with points for each data from occurence matrix 
+```{r}
+cyt<- read.csv("CytBData.csv", header=TRUE) #has coordinates lat/long for cytb coli
+cyt[is.na(cyt)] <- 0
+wgscoor<- cyt
+coordinates(wgscoor) <- ~Longitude+Latitude
+proj4string(wgscoor)<- CRS("+proj=longlat +datum=WGS84")
+raster::shapefile(wgscoor, "CytBColi.shp", overwrite=T)
+#buffered in qGIS and imported below (0.5 degrees)
+```
+
+Colilargo Phyloraster
+```{r warning=F}
+shpcoli <- terra::vect("CytColiBuff/CytColiBuff.shp") # collection points with buffers 
+r2 <- shp2rast(shpcoli,sps.col = "Accession", ymask = FALSE, background = 0, resolution =0.5) # turn shp to raster with phyloraster function
+tree<- read.tree("ColiTreeJuly.tree") #load phylogenetic tree
+
+tips<- read.csv("tips_april23.csv", header=T)
+ # make tips match 
+pos_id <-match(tree$tip.label, tips$old)#element position
+colitree<-tree
+colitree$tip.label <- tips$new[pos_id] #here sorting by pos_id
+
+plot(colitree)
+##prid for phyloraster##
+dataprep<- phylo.pres(x=r2, tree=colitree, pruning= "tree") # take the data points for which their is phylo and shp. data
+
+ed <- rast.ed(dataprep$x, colitree)
+pdr <- rast.pd(x = dataprep$x, edge.path = dataprep$edge.path, 
+               branch.length = dataprep$branch.length) # get phlyo diversity with function from phyloraster
+plot(pdr$PD)
+```
+
+Normalize pd values by number of individuals
+```{r}
+#create df from raster layer of colilargo occ.
+layer_coli<- as.data.frame(r2, xy= T)
+
+#create dfs from PD values
+dfpd_coli<-as.data.frame(pdr$PD, xy=T)
+
+mean(dfpd_coli$PD[dfpd_coli$PD != 0])
+
+#merge and divide PD by # of individuals
+seqPD<- merge(dfpd_coli, layer_coli, by=c("x", "y"))
+seqPDsum<-seqPD
+seqPDsum$SeqSum <- rowSums(seqPDsum[,4:241] )
+seqPD$PD<- seqPDsum$PD/seqPDsum$SeqSum
+
+PD_colilargo<-data.frame(seqPD[1:3])
+max(PD_colilargo$PD)
+min(PD_colilargo$PD[PD_colilargo$PD != 0])
+
+r_PDcolilargo<-  rast(PD_colilargo, type="xyz")
+plot(r_PDcolilargo)
+```
+
+Make map pretty use shp files of chile and arg
+```{r}
+Chile<- read_sf("./CHL_adm/CHL_adm0.shp")
+Argentina <-read_sf("./ARG_adm/ARG_adm0.shp")
+SA <- st_union(Chile, Argentina)
+```
+
+Phylogenetic diversity Colilargo Map
+```{r}
+test2 <- terra::crop(r_PDcolilargo$PD, SA)
+
+ext <- floor(ext(SA))
+nr <- rast(ext, res = res(test2))
+raster::values(nr) <- 0
+testnew <- terra::mask(nr,SA)
+
+tn_ras<-rast(testnew)
+t2_ras<-rast(test2)
+
+res(tn_ras) <- 0.5
+res(t2_ras)<-0.5
+crs(t2_ras)<-crs(tn_ras)
+testnew <- resample(testnew, tn_ras)
+test2<-resample(test2, t2_ras)
+plot(test2)
+plot<- mosaic(test2,testnew, fun="max")
+
+PDplot <- terra::mask(plot,SA)
+
+color<-colorRampPalette(c("gray","lightyellow","yellow", "orange", "darkorange2","#aa0000")) 
+plot(PDplot,
+     main= "Colilargo Phylogenetic Diversity", ext=c(-80, -50, -60, -15), xlab="Longitude", ylab="Latitude",
+     col=color(100))
+```
+
+Plotting Phylo Div Colilargo GGPLOT
+```{r}
+pd_plot_df<- as.data.frame(PDplot, xy=TRUE)
+pd_plot<- subset(pd_plot_df, PD!=0)
+max<-subset(pd_plot_df, PD=0.1147386)
+pdzero<- subset(pd_plot_df, PD==0)
+xlim<-c(-80, -50)
+ylim<-c(-60, -15)
+
+
+pdmap<-ggplot(data = pd_plot) +
+    geom_raster(aes(x = x, y = y, fill = `PD`)) +
+    scale_fill_gradientn(colours = c("#fada5fff", "orange","darkorange2","#aa0000", "red4" ),
+                       breaks = c( 0.001, 0.01, 0.02, 0.03, 0.04),
+                       labels= c( "0.001", "0.01", "0.02", "0.03", "0.04"))+
+    geom_raster(data=pdzero, aes(x = x, y = y), show.legend = F)+
+    
+    theme(legend.position = "right",legend.box.spacing = unit(0, "pt"), panel.background = element_rect(fill = "white"),
+        panel.grid = element_line(color = "gray94"),
+        axis.title = element_text(face="bold"),
+        plot.title = element_text(hjust = 0.5, size=10)) +
+    coord_sf(xlim=xlim, ylim=ylim) +
+  labs(x="Longitude", y= "Latitude")+
+    ggtitle(expression(paste(bold("Phylogenetic Richness of "), bolditalic("O. longicaudatus"))))
+pdmap
+```
+
+
+
+
+
+
+
+
+##Part 4. Combine ANDV, Colilargo, and parasite species richness
+
+Combine PD, SR, latitude
+```{r}
+layer_coli<- as.data.frame(r2, xy= T)
+
+##with unique coords
+dfpd_coli<-as.data.frame(r_PDcolilargo$PD, xy=T)
+dfpar_coli<- as.data.frame(srcoli, xy=T)
+dfandv_coli<- as.data.frame(r_PDandv$PDandv, xy=T)
+colnames(dfandv_coli)[3]<-"PDandv"
+
+dfpar_coli$SR[dfpar_coli$SR==0]<-NA
+dfpd_coli$PD[dfpd_coli$PD==0]<-NA
+dfandv_coli$PDandv[dfandv_coli$PDandv==0]<-NA
+
+#with matched standard coooooords 
+pdcoli<-as.data.frame(PDplot, xy=T)
+srcoli<-as.data.frame(srSA, xy=T) 
+andvcoli<-as.data.frame(PDplot_andv, xy=T)
+colnames(andvcoli)[3]<-"PDandv"
+srcoli$SR[srcoli$SR==0]<-NA
+pdcoli$PD[pdcoli$PD==0]<-NA
+andvcoli$PDandv[andvcoli$PDandv==0]<-NA
+
+colilargo<- merge(pd_plot, andv_plot, by=c("x","y"))
+
+dfnew<- merge(pdcoli, srcoli,  by= c("x", "y"))
+dfnew<- merge(dfnew, andvcoli, by=c("x","y"))
+dfsub<- subset(dfnew, ! (is.na(PD) & (is.na(SR)) & is.na(PDandv))) ### this is for climate
+
+write.csv(dfsub, "climate_df.csv")
+
+subdf_coli<- subset(dfnew, PD!=0 & PDandv!=0) ##NO NA FOR ANDV AND COLI
+
+write.csv(dfnew, "dfnew.csv")
+
+
+```
+
+
+
+
+
+
+##Part 5. Nucleotide and Haplotype Diversity of Colilargo
+
+Load Sequence data and cluster all sequences
+```{r}
+cyt<- read.csv("CytBData.csv", header=TRUE) #info for the sequences
+coor<- as.data.frame(cbind(cyt$Longitude, cyt$Latitude))
+clusters<- balanced_clustering(coor, 17, method="centroid") #237/17=
+cluster<- as.data.frame(clusters)
+cyt$cluster<- cluster
+```
+
+Align and trim sequences 
+```{r }
+fa <- readDNAStringSet("CytBColi.fasta")
+len <- seqlengths(fa)
+len<-as.data.frame(len)
+write.csv(len, "lengths.csv")
+len<- read.csv("lengths.csv")
+sublen<- subset(len, len>800)
+
+subfa<- fa[c(which(names(fa) %in% sublen$X))]
+
+align<-msaMuscle(subfa)
+alignment2Fasta(align, 'alignment.fasta') #my function
+
+aligncon<- readFasta('alignment.fasta')
+
+trimmed_align<- msaTrim(aligncon, gap.end = 0.1, gap.mid = 0.9)
+
+msa.mat <-as.data.frame(msa2mat(trimmed_align) )
+write.csv(msa.mat, "msa.mat.csv")
+msa.mat<-read.csv("msa.mat.csv", header=TRUE)
+tips<- read.csv("msalabels.csv", header=TRUE) # a table to change the tip labels
+msa.mat$X[msa.mat$X %in% tips$old] <- tips$new
+msa.mat$X[msa.mat$X %in% cyt$Accession]<- cyt$cluster$clusters
+msa.mat$X<-as.character(msa.mat$X)
+```
+
+Caluclate haplotype and nucleotide diversity by cluster
+```{r}
+#### HAPLOTYPE DIVERSITY BY CLUSTER #####
+hap<-list()
+  for(i in 1:length(unique(msa.mat$X))){
+  name = unique(msa.mat$X)[i]
+  df=  filter(msa.mat, X==name)
+  mat= as.matrix(df)
+  bin = ape::as.DNAbin(mat)
+  div= hap.div(bin)
+  hap[[i]]<-div
+  }
+
+hapdf<-do.call(rbind.data.frame, hap)
+hapdf$cluster<- row.names(hapdf)
+
+#### NUCLEOTIDE DIVERSITY BY CLUSTER #####
+nuc<-list()
+  for(i in 1:length(unique(msa.mat$X))){
+  name = unique(msa.mat$X)[i]
+  df=  filter(msa.mat, X==name)
+  mat= as.matrix(df)
+  bin = ape::as.DNAbin(mat)
+  div= nuc.div(bin)
+  nuc[[i]]<-div
+  }
+
+nucdf<-do.call(rbind.data.frame, nuc)
+nucdf$cluster<- row.names(nucdf)
+```
+
+Now we want to connect the nucleotide and haplotype diversity to values of parasite species richness, ANDV phylogenetic richness, and environmental variables
+Need to match lat long from parasites to pd to map back. This finds the lat long in parasites that is closest to pd and then assigns the parasite richness to that coordinate
+```{r}
+seqPD2<-subset(seqPD, PD!=0) ## seqPD is from line 429 ;)
+for (i in 4:ncol(seqPD2)) {
+  seqPD2[[i]] <- ifelse(seqPD2[[i]] == 1, seqPD2$PD, 0) ##replace binary vals with PD val
+}
+
+pdacc<-(seqPD2[,4:ncol(seqPD2)])
+pdacc<-as.data.frame(cbind(unlist(pdacc, use.names = FALSE), rep(names(pdacc), each = nrow(pdacc))))
+pdacc<-subset(pdacc, V1 !=0)
+write.csv(seqPD2, "SeqPD.csv")
+
+pdacc<- pdacc %>% group_by(V2) %>% top_n(1, V1) %>% distinct(V1, V2, .keep_all = TRUE) #get rid of duplicates
+colnames(pdacc)[1] <-"trait"
+colnames(pdacc)[2] <-"label"
+
+tree<- read.tree("ColiTreeApril23_bs.tree") #load phylogenetic tree
+
+tips<- read.csv("tips_april23.csv", header=T)
+ # make tips match 
+pos_id <-match(tree$tip.label, tips$old)#element position
+tree$tip.label <- tips$new[pos_id] #here sorting by pos_id
+
+pdtable <- full_join(tree, pdacc, by = 'label')
+pd <- as_tibble(pdtable)
+pd$trait[is.na(pd$trait)] <- 0
+pd$trait<- as.numeric(pd$trait)
+pdtree<- as.treedata(pd)
+
+dfpd <- reshape2::melt(pdacc, id = "label")
+dfpd$value<- as.numeric(dfpd$value)
+```
+
+Parasites
+```{r}
+seqPD2<- merge(dfpd_coli, layer_coli, by=c("x", "y"))
+#match the lat and long from the parasites and pd
+new<-dfpar_coli %>%
+  rename(Latpar=x, Lonpar=y) %>%
+  crossing(seqPD2) %>%
+  mutate(dist=sqrt((x-Latpar)^2+(y-Lonpar)^2)) %>%
+  group_by(x, y) %>%
+  filter(dist==min(dist)) %>%
+  ungroup() %>%
+  select(x, y, PD, SR)
+
+
+#merge the dbs 
+sr_seq<- merge(new, seqPD2, by=c("x", "y") )
+sr_seq<- subset(sr_seq, PD.x !=0 | SR !=0)
+for (i in 4:ncol(seqPD2)) {
+  seqPD2[[i]] <- ifelse(seqPD2[[i]] == 1, seqPD2$PD, 0) ##replace binary vals with PD val
+}
+for (i in 6:ncol(sr_seq)) {
+ sr_seq[[i]] <- ifelse(sr_seq[[i]] == 1, sr_seq$SR, 0) ##replace binary vals with Sr val
+}
+
+spacc<-(sr_seq[,6:ncol(sr_seq)])
+spacc<-as.data.frame(cbind(unlist(spacc, use.names = FALSE), rep(names(spacc), each = nrow(spacc))))
+spacc<-subset(spacc, V1 !=0)
+
+spacc<- spacc %>% group_by(V2) %>% top_n(1, V1) %>% distinct(V1, V2, .keep_all = TRUE)
+colnames(spacc)[1] <-"trait"
+colnames(spacc)[2] <-"label"
+
+df <- reshape2::melt(spacc, id = "label")
+df$value<- as.numeric(df$value)## use df for parasite species richness
+
+```
+
+ANDV pd
+```{r}
+seqPD2<- merge(dfpd_coli, layer_coli, by=c("x", "y"))
+#match the lat and long from the parasites and pd
+new_andv<-dfandv_coli %>%
+  rename(LatPD=x, LonPD=y) %>%
+  crossing(seqPD2) %>%
+  mutate(dist=sqrt((x-LatPD)^2+(y-LonPD)^2)) %>%
+  group_by(x, y) %>%
+  filter(dist==min(dist)) %>%
+  ungroup() %>%
+  select(x, y, PDandv)
+
+#merge the dbs 
+andv_seq<- merge(new_andv, seqPD2, by=c("x", "y") )
+andv_seq<- subset(andv_seq, PD !=0 | PDandv !=0)
+
+for (i in 5:ncol(andv_seq)) {
+ andv_seq[[i]] <- ifelse(andv_seq[[i]] == 1, andv_seq$PDandv, 0) ##replace binary vals with Sr val
+}
+
+andv_acc<-(andv_seq[,5:ncol(andv_seq)])
+andv_acc<-as.data.frame(cbind(unlist(andv_acc, use.names = FALSE), rep(names(andv_acc), each = nrow(andv_acc))))
+andv_acc<-subset(andv_acc, V1 !=0)
+
+andv_acc<- andv_acc %>% group_by(V2) %>% top_n(1, V1) %>% distinct(V1, V2, .keep_all = TRUE)
+colnames(andv_acc)[1] <-"trait"
+colnames(andv_acc)[2] <-"label"
+
+tree<- read.tree("ColiTreeApril23_bs.tree") #load phylogenetic tree
+
+tips<- read.csv("tips_april23.csv", header=T)
+ # make tips match 
+pos_id <-match(tree$tip.label, tips$old)#element position
+colitree<-tree
+colitree$tip.label <- tips$new[pos_id] #here sorting by pos_id
+tips<-as.data.frame(tree$tip.label)
+colnames(tips)[1] <- "label"
+#dfed<- merge(edacc, tips, by=c("label"))
+df_andv <- reshape2::melt(andv_acc, id = "label")
+df_andv$value<- as.numeric(df_andv$value)
+## use df for parasite species richness
+```
+
+Total Data frame with points traced back to accession coordinates 
+```{r}
+###df merge all ###
+tot<- merge(dfpd, df, by= c("label"), all=T)
+total_df<- merge(tot, df_andv, by=c("label"), all=T)
+
+total_df$variable.x<- NULL
+total_df$variable.y<-NULL
+total_df$variable<-NULL
+
+colnames(total_df)[2]<-"ColiPD"
+colnames(total_df)[3]<-"ColiParasite"
+colnames(total_df)[4]<-"andvPD"
+colnames(cyt)[4] <-"label"
+
+dftotal<- merge(total_df, cyt, by=c("label"), all=T)
+write.csv(dftotal, "dftotal.csv") #tracced to acc
+```
+
+get clim data for accession df
+```{r}
+geodata::geodata_path("/Users/rbrennan/Library/Mobile Documents/com~apple~CloudDocs/Documents/VT/Projects/Chapter2/Olivacea") ##path to your geodata
+r<-geodata::worldclim_global(res=10, var="bio")
+r<- r[[c(1,12)]]
+names(r) <- c("Temp","Prec")
+coords<- data.frame(x=dftotal$Longitude, y=dftotal$Latitude)
+points<-vect(coords, geom=c("x","y"), crs ="+proj=longlat +datum=WGS84")
+
+values <- terra::extract(r, points, xy=TRUE) #get the temp and precip for each point of diversity (genetic, andv, parasite)
+df_acc_clim <- cbind.data.frame(values, dftotal) # same order
+df_acc_clim$X<-NULL
+write.csv(df_acc_clim, "df_acc_clim.csv")
+```
+
+Climate analysis by cluster
+```{r}
+
+#sr_cluster<- merge(cyt, df_acc_clim, by=c('label'))
+
+sum_sr<- df_acc_clim %>% group_by(cluster$clusters) %>% summarize(sumpar = mean(ColiParasite), latitude= mean(Latitude),
+                                                                   longitude= mean(Longitude),
+                                                                 coliphy = mean(ColiPD), andvphy = mean(andvPD), 
+                                                                 temp=mean(Temp), prec=mean(Prec))
+
+colnames(sum_sr)[1]<-"cluster"
+sr_hap <- merge(sum_sr, hapdf, by=c("cluster"))
+colnames(sr_hap)[9]<-"hap"
+coli_total <- merge(sr_hap, nucdf, by=c("cluster"))
+colnames(coli_total)[10]<-"nuc"
+
+ggplot(coli_total, aes(x=hap, y=latitude, color=sumpar))  + theme_bw()+
+  labs(title="Haplotype Diversity by latitude",
+       x="coliphy", y = "andvphy") +
+      scale_color_gradient2(low="#0f46d1ff", mid="#fada5fff",high= "red",limits=c(0,10),midpoint= 5, name="Parasite SR") + geom_point(size=5)
+
+ggplot(coli_total, aes(x=nuc, y=latitude, color= sumpar))  + theme_bw()+
+  labs(title="Nucleotide Diversity by latitude",
+       x="Nucleotide diversity", y = "latitude") +
+      scale_color_gradient2(low="#0f46d1ff", mid="#fada5fff",high= "red",limits=c(0,10),midpoint= 5, name="Parasite SR") + geom_point(size=5)
+```
+
+
+
+
+
+
+
+##Part 6. Build geographic and environmental space
+
+get GBIF occurences for Oligoryzomys longicaudatus
+```{r, eval=FALSE}
+species<-"Oligoryzomys longicaudatus"
+gbif_taxon_keys <- 
+species %>% # use only first 1000 names for testing
+name_backbone_checklist()  %>% # match to backbone
+filter(!matchType == "NONE") %>% # get matched names
+pull(usageKey)
+
+occ_download(
+pred_in("taxonKey", gbif_taxon_keys),
+format = "SIMPLE_CSV")
+```
+clean occurrences
+```{r}
+ data <- occ_download_get('0000269-250121130708018') %>%
+    occ_download_import() 
+# select columns of interest
+dat <- data %>%
+  dplyr::select(species, decimalLongitude, 
+                decimalLatitude, countryCode, individualCount,
+                gbifID, family, taxonRank, coordinateUncertaintyInMeters,
+                year, basisOfRecord, institutionCode)
+
+
+# remove records without coordinates
+dat <- dat %>% filter(!is.na(decimalLongitude)) %>% filter(!is.na(decimalLatitude))
+dat$countryCode <-  countrycode(dat$countryCode, 
+                                origin =  'iso2c',
+                                destination = 'iso3c')
+#flag problems
+dat <- data.frame(dat)
+flags <- clean_coordinates(x = dat, 
+                           lon = "decimalLongitude", 
+                           lat = "decimalLatitude",
+                           countries = "countryCode",
+                           species = "species",
+                           tests = c("capitals", "centroids",
+                                     "equal", "zeros", "countries"))
+
+#Exclude problematic records
+dat_cl <- dat[flags$.summary,] ## these the good ones 
+
+#The flagged records
+dat_fl <- dat[!flags$.summary,]
+```
+get world clim for occ data from GBIF
+```{r}
+geodata::geodata_path("/Users/rbrennan/Library/Mobile Documents/com~apple~CloudDocs/Documents/VT/Projects/Chapter2/Olivacea")
+r<-geodata::worldclim_global(res=2.5, var="bio")
+plot(r)
+r<- r[[c(1,12)]]
+names(r) <- c("Temp","Prec")
+
+names(dat_cl)[2] <- "x"
+names(dat_cl)[3] <- "y"
+
+coords<- data.frame(x=dat_cl$x, y=dat_cl$y)
+points<-vect(coords, geom=c("x","y"), crs ="+proj=longlat +datum=WGS84")
+plot(points)
+
+values <-  terra::extract(r, points, xy=T) #extract clim variables from 'r' for 'points'
+occ_bio <- cbind.data.frame(values, dat_cl) # same order
+# where x.1 and y.1 are the originial latlong and x and y are the closest from worldclim
+
+write.csv(occ_bio, "occ_bio.csv")
+```
+Plot gbif occurences and calculate mean temp and precip and difference from mean for all gbif occurences
+```{r}
+occ_bio<-read.csv("occ_bio.csv", header=T)
+wallace<- data.frame(scientific_name=occ_bio$species, longitude= occ_bio$x.1, latitude=occ_bio$y.1)
+
+sapply(wallace, anyNA)
+
+write.csv(wallace, "ollo_wallace.csv") ##occurences for wallace, to be added to lit review records
+occ_bio$X<-NULL
+occ_bio$ID<-NULL
+occ_bio$species<-gsub(" ","_", occ_bio$species )
+#rename columns
+names(occ_bio)[3]<- "LonW"
+names(occ_bio)[4]<- "LatW"
+names(occ_bio)[6]<- "Longitude"
+names(occ_bio)[7]<- "Latitude"
+#check data by plotting
+wgscoor<- occ_bio
+coordinates(wgscoor) <- ~Longitude+Latitude
+proj4string(wgscoor)<- CRS("+proj=longlat +datum=WGS84")
+plot(wgscoor)
+
+plot(occ_bio$Temp, occ_bio$Prec)
+```
+
+Calculate Center of range using gbif.range
+```{r}
+# Download
+obs_pt = get_gbif(sp_name = "Oligoryzomys longicaudatus",
+                  basis = c("OBSERVATION","HUMAN_OBSERVATION","MACHINE_OBSERVATION"))
+# Plot species records
+countries = vect(ne_countries(type = "countries",returnclass = "sf"))
+plot(countries,col = "#bcbddc")
+points(obs_pt[,c("decimalLongitude","decimalLatitude")],pch=20,col="#99340470",cex=1.5)
+# Download ecoregion and read
+eco_terra = read_bioreg(bioreg_name = "eco_terra", save_dir = NULL)
+# Range
+range_coli = get_range(occ_coord = obs_pt,
+                        bioreg = eco_terra,
+                        bioreg_name = "ECO_NAME")
+plot(countries,col = "#bcbddc")
+plot(range_coli,col = "#238b45",add = TRUE,axes = FALSE,legend = FALSE)
+
+colirange <- terra::as.polygons(range_coli) #have to change to calculate centroid
+colirange<-sf::st_as_sf(colirange)
+
+cent<- st_centroid(st_geometry(colirange)) #calculate centroid
+coords_cent <- st_coordinates(cent)
+```
+
+get world clim data for the parasite/genetic occurences
+```{r}
+geodata::geodata_path("/Users/rbrennan/Library/Mobile Documents/com~apple~CloudDocs/Documents/VT/Projects/Chapter2/Olivacea")
+r<-geodata::worldclim_global(res=10, var="bio")
+
+r<- r[[c(1,12)]]
+names(r) <- c("Temp","Prec")
+
+subdf<- read.csv("climate_df.csv", header=T) # from 537 this has the Phylo Div, ANDV div, and Parasite species richness for Colilargo associated with                                                  longitude and latitude
+subdf[1]<-NULL
+coords<- data.frame(x=subdf$x, y=subdf$y)
+points<-vect(coords, geom=c("x","y"), crs ="+proj=longlat +datum=WGS84")
+
+
+values <- terra::extract(r, points, xy=TRUE) #get the temp and precip for each point of diversity (genetic, andv, parasite)
+occ_bio_par <- cbind.data.frame(values, subdf) # same order
+occ_bio_par[4]<-NULL
+occ_bio_par[4]<-NULL
+```
+
+Calculate the distance to range centroid geo
+```{r}
+##CENTROID from gbif.range GEOGRAPHIC##
+x <- c(coords_cent[, "X"])
+y <- c(coords_cent[, "Y"])
+
+centdf<- as.matrix(data.frame(x,y))
+occdf<- as.matrix(data.frame(occ_bio_par$x, occ_bio_par$y))
+
+dist2cent<-distm(occdf,centdf, fun = distHaversine)
+occ_bio_par$distcent<- dist2cent
+```
+
+
+
+##Part 7. Suitability
+
+Suitability logistic
+```{r}
+Chile<- read_sf("./CHL_adm/CHL_adm0.shp")
+Argentina <-read_sf("./ARG_adm/ARG_adm0.shp")
+SA <- st_union(Chile, Argentina)
+
+##Transform suitability tif from maxent into map and dataframe
+suit<- rast(x="maxent_gbiflit_accepted_block/Oligoryzomys_longicaudatus_fc.L_rm.0.5_logistic.tif")
+test2 <- terra::crop(suit, SA)
+ext <- floor(ext(SA))
+nr <- rast(ext, res = res(test2))
+raster::values(nr) <- 0
+testnew <- terra::mask(nr,SA)
+
+tn_ras<-rast(testnew)
+t2_ras<-rast(test2)
+
+res(tn_ras) <- 0.5
+res(t2_ras)<-0.5
+crs(t2_ras)<-crs(tn_ras)
+testnew <- resample(testnew, tn_ras)
+test2<-resample(test2, t2_ras)
+
+plot(test2)
+plot_suit<- mosaic(test2,testnew, fun="max")
+
+suit_plot <- terra::mask(plot_suit,SA)
+plot(suit_plot)
+suit_df<- as.data.frame(suit_plot, xy=TRUE)
+names(suit_df)[3]<-"suit"
+```
+Binary map
+```{r}
+# Load original binary raster
+bin <- rast("maxent_gbiflit_accepted_block/Oligoryzomys_longicaudatus_fc.L_rm.0.5_p10.tif")
+
+# Binarize in case of float values
+bin[] <- ifelse(bin[] >= 0.5, 1, 0)
+
+# Crop and mask to SA shape
+bin_crop <- crop(bin, SA)
+bin_mask <- terra::mask(bin_crop, SA)
+
+# MATCH GRID: Use suit_plot as the template (has correct res, extent, crs, alignment)
+template <- suit_plot  # already aligned to SA, 0.5 deg
+
+# --- KEY STEP: aggregate BEFORE resample to preserve sparse 1s ---
+# Estimate aggregation factor between bin and template resolution
+fact_x <- round(res(template)[1] / res(bin_mask)[1])
+fact_y <- round(res(template)[2] / res(bin_mask)[2])
+fact <- c(fact_x, fact_y)
+
+# Aggregate with max: if any underlying pixel is 1, keep 1
+bin_agg <- aggregate(bin_mask, fact = fact, fun = "max", na.rm = TRUE)
+
+# Align to template exactly (grid matching)
+bin_res <- resample(bin_agg, template, method = "near")
+
+# Final mask (in case of slight edge artifacts)
+bin_plot <- terra::mask(bin_res, SA)
+plot(bin_plot)
+
+# Convert to df
+bin_df <- as.data.frame(bin_plot, xy = TRUE)
+names(bin_df)[3] <- "binary"
+
+```
+database merge
+```{r}
+######
+occ_bio_suit<- merge(suit_df, occ_bio_par, by=c("x", "y"))
+#occ_bio_suit2<- read.csv("occ_bio_suit.csv", header=T) ##original file for next steps of plotting and analysis. If analysis re-done at future data, values might be slightly different since occurences are accessed directly from GBIF and algorithms may slightly differ.
+occ_bio_suit$X<-NULL
+occ_bio_suit2<- merge(occ_bio_suit, bin_df, by=c("x", "y"))
+
+plot(occ_bio_suit$suit, occ_bio_suit$SR)
+
+suit_plot_nozero<- subset(suit_df, suit!=0)
+suitzero<- subset(suit_df, suit == 0)
+
+
+```
+Plots
+```{r, warning=F}
+xlim<-c(-80, -50)
+ylim<-c(-60, -15)
+suit_map<-ggplot(data = suit_plot_nozero) +
+    geom_raster(aes(x = x, y = y, fill = `suit`)) +
+    scale_fill_gradientn(colours = c( "#FFFFCC",  "#FFD966", "#FFB84D", 
+            "#FF9933", "#FF6600", "#CC3300", "#990000"),
+                       breaks = c(0, 0.2, 0.4, 0.6, 0.8, 1),
+                       labels= c("0", "0.2", "0.4", "0.6", "0.8", "1"),
+            name="suitability")+
+    geom_raster(data=suitzero, aes(x = x, y = y), show.legend = F)+
+    
+    theme(legend.position = "right",legend.box.spacing = unit(0, "pt"), panel.background = element_rect(fill = "white"),
+        panel.grid = element_line(color = "gray94"),
+        axis.title = element_text(face="bold"),
+        plot.title = element_text(hjust = 0.5)) +
+    coord_sf(xlim=xlim, ylim=ylim) +
+  labs(x="Longitude", y= "Latitude")+
+    ggtitle(expression(paste(bold("Suitability of "), bolditalic("O. longicaudatus"))))
+
+envSuit<- ggplot(occ_bio_suit, aes(x=Temp, y=Prec, color=suit))  + theme_bw()+
+  labs(title="Suitability in Environmental Space",
+       x="Temperature", y = "Precipitation", size=100) +  scale_color_gradient2(mid="#fada5fff", high="red",name="Suitability") + geom_point(size=2)  + theme(axis.text=element_text(size=12),
+        axis.title=element_text(size=14,face="bold"), plot.title = element_text(size=13, face="bold"))
+
+suit_map
+envSuit
+```
+plots from wallace data direct
+```{r}
+wallace_df<- as.data.frame (suit, xy=TRUE)
+names(wallace_df)[3]<-"suit"
+geodata::geodata_path("/Users/rbrennan/Documents/BePhyNE")
+r<-geodata::worldclim_global(res=2.5, var="bio")
+r<- r[[c(1,12)]]
+names(r) <- c("Temp","Prec")
+
+coords<- data.frame(x=wallace_df$x, y=wallace_df$y)
+points<-vect(coords, geom=c("x","y"), crs ="+proj=longlat +datum=WGS84")
+
+
+values <- terra::extract(r, points, xy=TRUE) #extract clim variables from 'r' for 'points'
+wallace_values <- cbind.data.frame(values, wallace_df) 
+wallace_values[6]<-NULL
+wallace_values[6]<-NULL
+wallace_env<- ggplot(wallace_values, aes(x=Temp, y=Prec, color=suit))  + theme_bw()+
+  labs(title="Habitat Suitability in Environmental Space", x="Temperature", y = "Precipitation", size=100) +  scale_color_gradient2(mid="#fada5fff", high="red",name="Suitability") +
+   geom_point(size=2)  + theme(axis.text=element_text(size=12),
+        axis.title=element_text(size=14,face="bold"), plot.title = element_text(size=13, face="bold"))
+wallace_env
+plot<-ggplot() +
+  # Plot wallace_values points with color by suit
+  geom_point(data = wallace_values, aes(x = Temp, y = Prec, color = suit), size = 2) +
+  # Overlay occ_bio_suit as black "x" points
+  geom_point(data = occ_bio_suit, aes(x = Temp, y = Prec), shape = 4, color = "black", size = 2) +
+  # Optional: continuous color scale and styling
+  scale_color_gradient2(mid="#fada5fff", high="red",name="Suitability")  +
+  theme_minimal() +
+  labs(x = "Temperature", y = "Precipitation", color = "Suitability")
+plot
+```
+south america
+```{r}
+library(rmapshaper)
+Chile<- read_sf("./CHL_adm/CHL_adm0.shp")
+Argentina <-read_sf("./ARG_adm/ARG_adm0.shp")
+SA <- st_union(Chile, Argentina)
+SA_simple<- rmapshaper::ms_simplify(SA, keep = 0.05)
+```
+Dist to gbif centroid from thinned data
+only gbif data used for first suitability analysis, from Chile/Arg in accepted range
+```{r}
+gbif_thin<- read.csv("Oligoryzomys_longicaudatus_user_raw_GBIF_ChileArg.csv", header=T)
+coords<- data.frame(x=gbif_thin$longitude, y=gbif_thin$latitude)
+points_gbif<-vect(coords, geom=c("x","y"), crs ="+proj=longlat +datum=WGS84")
+
+points_gbif_sf <- sf::st_as_sf(points_gbif)
+
+# Plot South America with points
+mapgbif<-ggplot() +
+  geom_sf(data = SA_simple, fill = "gray95", color = "black") +
+  geom_sf(data = points_gbif_sf, color = "red", size = 0.5) +
+  coord_sf(xlim = c(-85, -50), ylim = c(-60, -15), expand = FALSE) +
+  theme_minimal() +
+  labs(title = "GBIF Accepted over Chile and Argentina",
+       x = "Longitude", y = "Latitude")
+
+
+values <- terra::extract(r, points_gbif, xy=TRUE) #get the temp and precip for each point of diversity (genetic, andv, parasite)
+gbif_thin<- cbind.data.frame(values, gbif_thin) # same order
+
+centroid_gbif<- data.frame(Temp = mean(gbif_thin$Temp, na.rm = TRUE),
+                       Prec = mean(gbif_thin$Prec, na.rm = TRUE))
+
+# Combine the centroid and occ_bio_suit into a single matrix
+combined_gbif <- rbind(centroid_gbif, occ_bio_suit[, c("Temp", "Prec")])
+
+# Use dist() to calculate Euclidean distances
+dists_gbif <- dist(combined_gbif, method = "euclidean")
+
+# Extract the distances from the centroid (row 1) to all other rows
+# dist() returns the lower triangle of the distance matrix as a vector,
+# so we need to extract only the distances from the first row to the rest.
+# The first n-1 elements of the result will be those.
+dist_to_gbif <- as.matrix(dists_gbif)[-1, 1]
+
+# Add to the data frame
+occ_bio_suit$dist_to_gbif <- dist_to_gbif
+```
+dist to my points 
+lit points only
+```{r}
+litrev<- read.csv("Genetic_Parasite_Coords.csv", header=T)
+litrev$Longitude<-as.numeric(litrev$Longitude)
+coords<- data.frame(x=litrev$Longitude, y=litrev$Latitude)
+points_lit<-vect(coords, geom=c("x","y"), crs ="+proj=longlat +datum=WGS84")
+
+points_lit_sf <- sf::st_as_sf(points_lit)
+
+# Plot South America with points
+map_lit<-ggplot() +
+  geom_sf(data = SA_simple, fill = "gray95", color = "black") +
+  geom_sf(data = points_lit_sf, color = "red", size = 0.5) +
+  coord_sf(xlim = c(-85, -50), ylim = c(-60, -15), expand = FALSE) +
+  theme_minimal() +
+  labs(title = "Points from literature review",
+       x = "Longitude", y = "Latitude")
+
+
+
+values <- terra::extract(r, points_lit, xy=TRUE) #get the temp and precip for each point of diversity (genetic, andv, parasite)
+litrev<- cbind.data.frame(values, litrev) # same order
+### dif to my POINTS
+centroid_lit<- data.frame(Temp = mean(litrev$Temp, na.rm = TRUE),
+                       Prec = mean(litrev$Prec, na.rm = TRUE))
+
+# Combine the centroid and occ_bio_suit into a single matrix
+combined_lit<- rbind(centroid_lit, occ_bio_suit[, c("Temp", "Prec")])
+
+# Use dist() to calculate Euclidean distances
+dists_lit <- dist(combined_lit, method = "euclidean")
+
+# Extract the distances from the centroid (row 1) to all other rows
+# dist() returns the lower triangle of the distance matrix as a vector,
+# so we need to extract only the distances from the first row to the rest.
+# The first n-1 elements of the result will be those.
+dist_to_lit <- as.matrix(dists_lit)[-1, 1]
+
+# Add to the data frame
+occ_bio_suit$dist_to_lit <- dist_to_lit
+
+```
+dist to realized accepted lit and gbif
+```{r}
+allacc<- read.csv("Oligoryzomys_longicaudatus_processed_occs.csv", header=T)
+
+coords_allacc<- data.frame(x=allacc$longitude, y=allacc$latitude)
+points_allacc<-vect(coords_allacc, geom=c("x","y"), crs ="+proj=longlat +datum=WGS84")
+
+points_allacc_sf <- sf::st_as_sf(points_allacc)
+
+# Plot South America with points
+map_allacc<-ggplot() +
+  geom_sf(data = SA_simple, fill = "gray95", color = "black") +
+  geom_sf(data = points_allacc_sf, color = "red", size = 0.5) +
+  coord_sf(xlim = c(-85, -50), ylim = c(-60, -15), expand = FALSE) +
+  theme_minimal() +
+  labs(title = "Points from GBIF and Lit in accepted range",
+       x = "Longitude", y = "Latitude")
+
+
+
+values <- terra::extract(r, points_allacc, xy=TRUE) #get the temp and precip for each point of diversity (genetic, andv, parasite)
+allacc<- cbind.data.frame(values, allacc) # same order
+### dif to my POINTS
+centroid_allacc<- data.frame(Temp = mean(allacc$Temp, na.rm = TRUE),
+                       Prec = mean(allacc$Prec, na.rm = TRUE))
+
+# Combine the centroid and occ_bio_suit into a single matrix
+combined_allacc<- rbind(centroid_allacc, occ_bio_suit[, c("Temp", "Prec")])
+
+# Use dist() to calculate Euclidean distances
+dists_allacc <- dist(combined_allacc, method = "euclidean")
+
+# Extract the distances from the centroid (row 1) to all other rows
+# dist() returns the lower triangle of the distance matrix as a vector,
+# so we need to extract only the distances from the first row to the rest.
+# The first n-1 elements of the result will be those.
+dist_to_allacc <- as.matrix(dists_allacc)[-1, 1]
+
+# Add to the data frame
+occ_bio_suit$dist_to_allacc <- dist_to_allacc
+
+
+```
+dist to full realized centroid:
+lit points plus all Gbif chile arg
+```{r}
+full_rec<-read.csv("Oligoryzomys_longicaudatus_processed_occs_GBIF_Lit_ChileArg.csv", header=T)
+
+coords<- data.frame(x=full_rec$longitude, y=full_rec$latitude)
+points_full<-vect(coords, geom=c("x","y"), crs ="+proj=longlat +datum=WGS84")
+
+points_full_sf <- sf::st_as_sf(points_full)
+
+# Plot South America with points
+map_full<-ggplot() +
+  geom_sf(data = SA_simple, fill = "gray95", color = "black") +
+  geom_sf(data = points_full_sf, color = "red", size = 0.5) +
+  coord_sf(xlim = c(-85, -50), ylim = c(-60, -15), expand = FALSE) +
+  theme_minimal() +
+  labs(title = "GBIF and Lit Review",
+       x = "Longitude", y = "Latitude")
+
+values <- terra::extract(r, points_full, xy=TRUE) #get the temp and precip for each point of diversity (genetic, andv, parasite)
+full_rec<- cbind.data.frame(values, full_rec) # same order
+
+centroid_realized<- data.frame(Temp = mean(full_rec$Temp, na.rm = TRUE),
+                       Prec = mean(full_rec$Prec, na.rm = TRUE))
+
+# Combine the centroid and occ_bio_suit into a single matrix
+combined_realized<- rbind(centroid_realized, occ_bio_suit[, c("Temp", "Prec")])
+
+# Use dist() to calculate Euclidean distances
+dists_real <- dist(combined_realized, method = "euclidean")
+
+# Extract the distances from the centroid (row 1) to all other rows
+# dist() returns the lower triangle of the distance matrix as a vector,
+# so we need to extract only the distances from the first row to the rest.
+# The first n-1 elements of the result will be those.
+dist_to_realized <- as.matrix(dists_real)[-1, 1]
+
+# Add to the data frame
+occ_bio_suit$dist_to_realized <- dist_to_realized
+
+```
+Binary environmental space and fundamental centroid
+```{r}
+coords_bin<- data.frame(x=bin_df$x, y=bin_df$y)
+points_bin<-vect(coords_bin, geom=c("x","y"), crs ="+proj=longlat +datum=WGS84")
+plot(points_bin)
+
+values_bin <- terra::extract(r, points_bin, xy=TRUE) #extract clim variables from 'r' for 'points'
+bin_values <- cbind.data.frame(values_bin, bin_df) 
+bin_values[6]<-NULL
+bin_values[6]<-NULL
+bin1<- subset(bin_values, binary!=0)
+
+bin_env<- ggplot(bin1, aes(x=Temp, y=Prec, color=binary))  + theme_bw()+
+  labs(title="Binary Suitability in Environmental Space", x="Temperature", y = "Precipitation", size=100) + 
+   geom_point(size=2)  + theme(axis.text=element_text(size=12),
+        axis.title=element_text(size=14,face="bold"), plot.title = element_text(size=13, face="bold"))
+
+
+# Define centroid as a one-row data frame or matrix
+centroid <- data.frame(Temp = mean(bin_values$Temp, na.rm = TRUE),
+                       Prec = mean(bin_values$Prec, na.rm = TRUE))
+
+# Combine the centroid and occ_bio_suit into a single matrix
+combined <- rbind(centroid, occ_bio_suit[, c("Temp", "Prec")])
+
+# Use dist() to calculate Euclidean distances
+dists <- dist(combined, method = "euclidean")
+
+# Extract the distances from the centroid (row 1) to all other rows
+# dist() returns the lower triangle of the distance matrix as a vector,
+# so we need to extract only the distances from the first row to the rest.
+# The first n-1 elements of the result will be those.
+dist_to_centroid <- as.matrix(dists)[-1, 1]
+
+# Add to the data frame
+occ_bio_suit$dist_to_centroid <- dist_to_centroid
+```
+distance to fundamental from big Suit analysis
+```{r}
+bin2 <- rast("maxent_gbiflit_all_block/Oligoryzomys_longicaudatus_fc.L_rm.0.5_p10.tif")
+
+# Binarize in case of float values
+bin2[] <- ifelse(bin2[] >= 0.5, 1, 0)
+
+# Crop and mask to SA shape
+bin_crop2 <- crop(bin2, SA)
+bin_mask2 <- terra::mask(bin_crop2, SA)
+
+# MATCH GRID: Use suit_plot as the template (has correct res, extent, crs, alignment)
+template <- suit_plot  # already aligned to SA, 0.5 deg
+
+# --- KEY STEP: aggregate BEFORE resample to preserve sparse 1s ---
+# Estimate aggregation factor between bin and template resolution
+fact_x2<- round(res(template)[1] / res(bin_mask2)[1])
+fact_y2 <- round(res(template)[2] / res(bin_mask2)[2])
+fact2 <- c(fact_x2, fact_y2)
+
+# Aggregate with max: if any underlying pixel is 1, keep 1
+bin_agg2 <- aggregate(bin_mask2, fact = fact, fun = "max", na.rm = TRUE)
+
+# Align to template exactly (grid matching)
+bin_res2 <- resample(bin_agg2, template, method = "near")
+
+# Final mask (in case of slight edge artifacts)
+bin_plot2 <- terra::mask(bin_res2, SA)
+plot(bin_plot2)
+# Convert to df
+bin_df2 <- as.data.frame(bin_plot2, xy = TRUE)
+names(bin_df2)[3] <- "binary"
+###
+coords_bin2<- data.frame(x=bin_df2$x, y=bin_df2$y)
+points_bin2<-vect(coords_bin2, geom=c("x","y"), crs ="+proj=longlat +datum=WGS84")
+plot(points_bin2)
+
+values_bin2 <- terra::extract(r, points_bin2, xy=TRUE) #extract clim variables from 'r' for 'points'
+bin_values2 <- cbind.data.frame(values_bin2, bin_df2) 
+bin_values2[6]<-NULL
+bin_values2[6]<-NULL
+bin2<- subset(bin_values2, binary!=0)
+
+bin_env2<- ggplot(bin2, aes(x=Temp, y=Prec, color=binary))  + theme_bw()+
+  labs(title="Binary Suitability in Environmental Space", x="Temperature", y = "Precipitation", size=100) + 
+   geom_point(size=2)  + theme(axis.text=element_text(size=12),
+        axis.title=element_text(size=14,face="bold"), plot.title = element_text(size=13, face="bold"))
+
+
+# Define centroid as a one-row data frame or matrix
+centroid2 <- data.frame(Temp = mean(bin_values2$Temp, na.rm = TRUE),
+                       Prec = mean(bin_values2$Prec, na.rm = TRUE))
+
+# Combine the centroid and occ_bio_suit into a single matrix
+combined2 <- rbind(centroid2, occ_bio_suit[, c("Temp", "Prec")])
+
+# Use dist() to calculate Euclidean distances
+dists2 <- dist(combined2, method = "euclidean")
+
+# Extract the distances from the centroid (row 1) to all other rows
+# dist() returns the lower triangle of the distance matrix as a vector,
+# so we need to extract only the distances from the first row to the rest.
+# The first n-1 elements of the result will be those.
+dist_to_centroid2 <- as.matrix(dists2)[-1, 1]
+
+# Add to the data frame
+occ_bio_suit$dist_to_centroid2 <- dist_to_centroid2
+
+```
+those good good plots
+```{r}
+geodata::geodata_path("/Users/rbrennan/Documents/BePhyNE")
+r<-geodata::worldclim_global(res=2.5, var="bio")
+r<- r[[c(1,12)]]
+names(r) <- c("Temp","Prec")
+
+coords<- data.frame(x=suit_df$x, y=suit_df$y)
+points<-vect(coords, geom=c("x","y"), crs ="+proj=longlat +datum=WGS84")
+plot(points)
+
+values <- terra::extract(r, points, xy=TRUE) #extract clim variables from 'r' for 'points'
+suit_tp <- cbind.data.frame(values, suit_df) 
+suit_tp[6]<-NULL
+##continuous
+
+suit_tp <- suit_tp[order(suit_tp$suit), ]
+
+library(ggplot2)
+library(ggnewscale)
+
+centroid_all <- rbind(
+  data.frame(centroid, source = "Fundamental Centroid"),
+  data.frame(centroid_allacc, source = "Realized Centroid"),
+  data.frame(centroid_realized, source= "All Data Realized Centroid"),
+  data.frame(centroid2, source= "All Data Fundamental Centroid"),
+  data.frame(centroid_lit, source = "Literature Records Centroid"),
+  data.frame(centroid_gbif, source="GBIF Records Centroid")
+)
+# Prepare centroid source factor
+centroid_all$source <- factor(centroid_all$source,
+                              levels = c("Fundamental Centroid",
+                                         "Realized Centroid",
+                                         "All Data Realized Centroid",
+                                         "All Data Fundamental Centroid",
+                                         "Literature Records Centroid",
+                                         "GBIF Records Centroid"))
+
+# Split suitability
+suit_zero <- subset(suit_tp, suit == 0)
+suit_nonzero <- subset(suit_tp, suit > 0)
+
+
+cont2<-ggplot() +
+  # Suitability == 0 (gray), shown with legend
+  geom_point(data = suit_zero, aes(x = Temp, y = Prec, color = "Not Suitable"),
+             size = 2) +
+  scale_color_manual(
+    name= NULL,
+    values = c("Not Suitable" = "gray")
+  ) +
+
+  new_scale_color() +
+
+  # Suitability > 0 (yellow to red gradient)
+  geom_point(data = suit_nonzero, aes(x = Temp, y = Prec, color = suit), size = 2) +
+  scale_color_gradient2(mid = "#fada5fff", high = "red", name = "Suitability") +
+
+  new_scale_color() +
+
+  # Literature X points
+  geom_point(data = occ_bio_suit, aes(x = Temp, y = Prec, shape = "Literature Record"),
+             color = "black", size = 2) +
+
+  # Centroids: shapes + fill color
+  geom_point(data = centroid_all, aes(x = Temp, y = Prec, shape = source, fill = source),
+              size = 5, stroke = 0.8) +
+
+  # Shape legend (combined for X and centroids)
+  scale_shape_manual(
+    name = "Record Type",
+    values = c("Literature Record" = 4,
+               "Fundamental Centroid" = 21,
+               "Realized Centroid" = 24,
+              "All Data Realized Centroid"= 25,
+              "All Data Fundamental Centroid"= 15,
+              "Literature Records Centroid" = 22,
+              "GBIF Records Centroid"= 23 )
+  ) +
+
+  # Fill color for centroids (no name to avoid duplication)
+  scale_fill_manual(
+    values = c(
+               "Fundamental Centroid" = "blue",
+               "Realized Centroid" = "purple",
+               "All Data Realized Centroid"="black",
+                "All Data Fundamental Centroid"= "lightblue",
+               "Literature Records Centroid" = "green",
+               "GBIF Records Centroid"="magenta"
+      )
+  ) +
+
+  guides(
+    shape = guide_legend(override.aes = list(
+      fill = c( "blue", "purple","black","lightblue" ,"green", "magenta" ,NA),
+      color = "black",
+      stroke = 1.2,
+      size = 3
+    ))
+  ) +
+
+  theme_minimal() +
+  theme(axis.title.x = element_text(size=14, face="bold", colour = "black"),    
+    axis.title.y = element_text(size=14, face="bold", colour = "black"))+
+  labs(x = "Temperature", y ="Precipitation")+
+  ggtitle(expression(paste(bold("Suitability and Centroids of "), bolditalic("O. longicaudatus"))))
+  
+cont2
+```
+
+
+
+
+
+##Part 8. Final analyses and plots 
+plots
+```{r}
+
+###
+SR<-ggplot(occ_bio_suit, aes(x=suit, y=SR, color=distcent))  + theme_bw()+
+  labs(title="Predictors of Parasite Species Richness",
+       x="Suitability", y = "Parasite Species Richness") +
+       scale_color_gradient2(low="blue",mid="yellow", high="red",name="Distance to Center of Range") + geom_point()
+SR
+ANDV<- ggplot(occ_bio_suit, aes(x=distcent, y=PDandv, color=Prec ))  + theme_bw()+
+  labs(title="Predictors of ANDV Phylogenetic Richness",
+       x="Distance to Center of Range", y = "Phylogenetic Richness of ANDV") +
+       scale_color_gradient2(low="blue",mid="yellow", high="red",name="Precipiation") + geom_point()   
+ANDV
+##########
+envANDV<- ggplot(occ_bio_par, aes(x=Temp, y=Prec, color=PDandv))  + theme_bw()+
+  labs(title="Phylogenetic Richness of ANDV in Environmental Space",
+       x="Temperature", y = "Precipitation", size=100) +  scale_color_gradient2(mid="#fada5fff", high="red",name="PR \nANDV") + geom_point(size=2)  + theme(axis.text=element_text(size=12),
+        axis.title=element_text(size=14,face="bold"), plot.title = element_text(size=13, face="bold")) 
+envANDV
+envColi<- ggplot(occ_bio_suit, aes(x=Temp, y=Prec, color=PD))  + theme_bw()+
+  labs(x="Temperature", y = "Precipitation", size=100) + 
+   ggtitle(expression(paste(bold("Phylogenetic Richness of "), bolditalic("O. longicaudatus"))))+
+scale_color_gradient2(mid="#fada5fff", high="red",name="PR") + geom_point(size=2)  + theme(axis.text=element_text(size=12),
+        axis.title=element_text(size=14,face="bold"), plot.title = element_text(size=13, face="bold"))
+envColi
+envSR<- ggplot(occ_bio_par, aes(x=Temp, y=Prec, color=SR))  + theme_bw()+
+  labs(title="Parasite Species Richness Environmental Space",
+       x="Temperature", y = "Precipitation", size=100) +  scale_color_gradient2(mid="#fada5fff", high="red",name="SR") + geom_point(size=2)  + theme(axis.text=element_text(size=12),
+        axis.title=element_text(size=14,face="bold"), plot.title = element_text(size=13, face="bold"))
+envSR
+```
+
+Correlation tests
+```{r}
+plot(occ_bio_suit$y, occ_bio_suit$PDandv)
+plot(occ_bio_suit$PDandv,occ_bio_suit$suit)
+
+#haplotype
+cor.test(coli_total$andvphy,coli_total$hap, method = "spearman", use = "complete.obs")
+cor.test(coli_total$sumpar,coli_total$hap, method = "spearman", use = "complete.obs")
+cor.test(coli_total$coliphy,coli_total$hap, method = "spearman", use = "complete.obs")
+
+#nucleotide
+cor.test(coli_total$andvphy,coli_total$nuc, method = "spearman", use = "complete.obs")
+cor.test(coli_total$sumpar,coli_total$nuc, method = "spearman", use = "complete.obs")
+cor.test(coli_total$coliphy,coli_total$nuc, method = "spearman", use = "complete.obs")
+
+##check normality
+shapiro.test(occ_bio_suit$Temp)
+shapiro.test(occ_bio_suit$Prec)
+shapiro.test(occ_bio_suit$PD)
+shapiro.test(occ_bio_suit$SR)
+shapiro.test(occ_bio_suit$PDandv)
+shapiro.test(occ_bio_suit$distcent)
+shapiro.test(occ_bio_suit$suit)
+
+##cor tests
+cor.test(occ_bio_suit$PDandv,occ_bio_suit$PD, method = "spearman", use = "complete.obs")
+cor.test(occ_bio_suit$PDandv,occ_bio_suit$suit, method = "spearman", use = "complete.obs")
+cor.test(occ_bio_suit$PDandv,occ_bio_suit$Temp, method = "spearman", use = "complete.obs")
+cor.test(occ_bio_suit$PDandv,occ_bio_suit$Prec, method = "spearman", use = "complete.obs")
+cor.test(occ_bio_suit$PDandv,occ_bio_suit$distcent, method = "spearman", use = "complete.obs")
+cor.test(occ_bio_suit$PDandv,occ_bio_suit$dist_to_centroid, method = "spearman", use = "complete.obs")
+cor.test(occ_bio_suit$PDandv,occ_bio_suit$dist_to_realized, method = "spearman", use = "complete.obs")
+cor.test(occ_bio_suit$PDandv,occ_bio_suit$SR, method = "spearman", use = "complete.obs")
+##sr
+cor.test(occ_bio_suit$SR,occ_bio_suit$PD, method = "spearman", use = "complete.obs")
+cor.test(occ_bio_suit$SR,occ_bio_suit$suit, method = "spearman", use = "complete.obs")
+cor.test(occ_bio_suit$SR,occ_bio_suit$Temp, method = "spearman", use = "complete.obs")
+cor.test(occ_bio_suit$SR,occ_bio_suit$Prec, method = "spearman", use = "complete.obs")
+cor.test(occ_bio_suit$SR,occ_bio_suit$distcent, method = "spearman", use = "complete.obs")
+cor.test(occ_bio_suit$SR,occ_bio_suit$dist_to_centroid, method = "spearman", use = "complete.obs")
+cor.test(occ_bio_suit$SR,occ_bio_suit$dist_to_realized, method = "spearman", use = "complete.obs")
+
+## PD
+cor.test(occ_bio_suit$PD,occ_bio_suit$PD, method = "spearman", use = "complete.obs")
+cor.test(occ_bio_suit$PD,occ_bio_suit$suit, method = "spearman", use = "complete.obs")
+cor.test(occ_bio_suit$PD,occ_bio_suit$Temp, method = "spearman", use = "complete.obs")
+cor.test(occ_bio_suit$PD,occ_bio_suit$Prec, method = "spearman", use = "complete.obs")
+cor.test(occ_bio_suit$PD,occ_bio_suit$distcent, method = "spearman", use = "complete.obs")
+cor.test(occ_bio_suit$PD,occ_bio_suit$dist_to_centroid, method = "spearman", use = "complete.obs")
+cor.test(occ_bio_suit$PD,occ_bio_suit$dist_to_realized, method = "spearman", use = "complete.obs")
+
+
+##scaled multivariate##
+df_scaled <- as.data.frame(scale(occ_bio_suit[, -c(1:2)] ))
+
+model_sr <- lm(SR ~ PD + suit + Temp+ Prec+ distcent + dist_to_centroid, data = df_scaled)
+summary(model_sr)
+
+model_pdandv <- lm(PDandv ~ PD + suit + Temp+ Prec+ distcent +dist_to_centroid , data = df_scaled)
+summary(model_pdandv)
+
+model_pd <- lm(PD ~ suit + Temp+ Prec+ distcent +SR +dist_to_centroid, data = df_scaled)
+summary(model_pd)
+
+```
+
+correlation plot
+```{r}
+
+
+df_selected <- occ_bio_suit[, c("x", "y", "suit", "Temp", "Prec", "PD", "SR", "PDandv","distcent","dist_to_centroid","dist_to_allacc")]
+# Current column names in df_selected:
+# "x", "y", "suit", "Temp", "Prec", "PD", "SR", "PDandv","distcent","dist_to_centroid","dist_to_allacc"
+
+# Define the desired order of columns
+new_order <- c("SR", "PD", "PDandv",  "distcent", "dist_to_centroid", "dist_to_allacc", "x",    "y", "suit", "Temp", "Prec")
+
+# Reorder the dataframe
+df_corr <- df_selected[, new_order]
+
+# Rename for axis labels
+colnames(df_corr) <- c(
+  "Parasite Species Richness", 
+  "Phylogenetic Richness", 
+  "ANDV Phylogenetic Richness", 
+  "Distance to Geographic Centroid", 
+  "Distance to Fundamental Centroid", 
+  "Distance to Realized Centroid",
+  "Longitude", 
+  "Latitude", 
+  "Suitability", 
+  "Temperature", 
+  "Precipitation"
+)
+# Run this again
+# Compute Spearman correlations and p-values
+cor_test_spearman <- function(df) {
+  n <- ncol(df)
+  cor_mat <- matrix(NA, n, n)
+  p_mat <- matrix(NA, n, n)
+  colnames(cor_mat) <- colnames(p_mat) <- colnames(df)
+  rownames(cor_mat) <- rownames(p_mat) <- colnames(df)
+  
+  for (i in 1:n) {
+    for (j in 1:n) {
+      test <- cor.test(df[[i]], df[[j]], method = "spearman")
+      cor_mat[i, j] <- test$estimate
+      p_mat[i, j] <- test$p.value
+    }
+  }
+  
+  list(cor = cor_mat, p = p_mat)
+}
+
+results <- cor_test_spearman(df_corr)
+cor_matrix <- results$cor
+p_matrix <- results$p
+
+# Mask non-significant correlations
+cor_matrix[p_matrix >= 0.01] <- NA
+diag(cor_matrix) <- NA  # Optional: hide 1.0 on diagonal
+
+my_colors <- c("#2166AC", "#F7F7F7", "#B2182B")  # Blue-white-red
+
+corrplot<-ggcorrplot(cor_matrix,
+           method = "circle",
+           type = "lower",
+           lab = TRUE,
+           lab_size = 2.8,
+           tl.cex = 10,
+           tl.srt = 45,
+           ggtheme = theme_minimal(base_size = 12),
+           colors = my_colors,
+           outline.col = "white",
+           title = "Significant Spearman Correlations (p < 0.01)") +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+    panel.grid = element_blank()
+  )
+
+
+
+
+
+
+corrplot
+
+```
+
+regression plots
+```{r}
+SR <- ggplot(occ_bio_suit, aes(x = suit, y = SR, color = PD)) +
+  theme_bw() +
+
+  # Scatter points
+  geom_point() +
+
+  # Pearson correlation line + confidence interval
+  geom_smooth(method = "lm", se = TRUE, color = "black") +
+
+  # Axis limits based on data max
+  scale_x_continuous(limits = c(0, max(occ_bio_suit$suit, na.rm = TRUE))) +
+  scale_y_continuous(limits = c(0, max(occ_bio_suit$SR, na.rm = TRUE))) +
+
+  # Color gradient for distance to center
+  scale_color_gradient2(
+    low = "blue", mid = "yellow", high = "red",
+    name = "Phylogenetic\nRichness"
+  ) +
+
+  # Axis labels and plot title
+  labs(
+    title = "Predictors of Parasite Species Richness",
+    x = "Suitability",
+    y = "Parasite Species Richness"
+  ) +
+
+  # Bold axis and title text
+  theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    axis.title = element_text(face = "bold", size = 12),
+    axis.text = element_text(face = "bold", size = 10)
+  )
+SR
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ANDV<-
+  ggplot(occ_bio_suit, aes(x = distcent, y = PDandv, color = Temp)) +
+  theme_bw() +
+
+  # Scatter points
+  geom_point() +
+
+  # Pearson correlation line + confidence interval
+  geom_smooth(method = "lm", se = TRUE, color = "black") +
+
+  # Axis limits based on data max
+  scale_x_continuous(limits = c(0, 1250000)) +
+  scale_y_continuous(limits = c(0, max(occ_bio_suit$PDandv, na.rm = TRUE))) +
+
+  # Color gradient for distance to center
+  scale_color_gradient2(
+    low = "blue", mid = "yellow", high = "red",
+    name = "Temperature (C)"
+  ) +
+
+  # Axis labels and plot title
+  labs(
+    title = "Predictors of ANDV Phylogenetic Richness",
+    x = "Distance to Range Centroid",
+    y = "Phylogenetic Richness of ANDV"
+  ) +
+
+  # Bold axis and title text
+  theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    axis.title = element_text(face = "bold", size = 12),
+    axis.text = element_text(face = "bold", size = 10)
+  )
+ANDV
+```
+
