@@ -1,0 +1,10 @@
+name: "Environmental and Evolutionary Drivers of Parasite Diversity in Oligoryzomys longicaudatus"
+navbar:
+  title: "Environmental and Evolutionary Drivers of Parasite Diversity in Oligoryzomys longicaudatus"
+  left:
+    - text: "About"
+      href: index.html
+    - text: "Analysis"
+      href: Chapter2Code.html
+
+

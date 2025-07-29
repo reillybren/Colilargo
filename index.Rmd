@@ -1,0 +1,43 @@
+---
+title: "About"
+output: html_document
+
+---
+
+### Objective
+
+To determine what drives both intra-specific (within one single parasite) and inter-specific (parasite fauna of a host) parasite diversity for a single host species.
+
+
+### The System
+
+We are focusing on a rodent-parasite system in the neotropics (Chile), where hantavirus in endemic. The principal host for hantavirus in Chile and Argentina, Oligoryzomys longicaudatus, is our study focus. We the drivers of phylogenetic richness of Andes virus (the specific hantavirus in Chile and Argentina) and of total parasite species richness for O. longicaudatus. We consider both environmental and evolutionary drivers. 
+
+
+### Methods
+
+We gathered data on parasite species, ANDV, and host genetic data from an extensive literature review
+
+Part 1. Parasite species richness: in this section we assess the parasite species richness of O. longicaudatus using our records from the literature review. 
+
+Part 2. Here we infer an evolutionary history for ANDV and map the phylogenetic richness (ie. average phylogenetic diversity)
+
+Part 3. Here we infer an evolutionary history for O. longicaudatus and map the phylogenetic richness (ie. average phylogenetic diversity)
+
+Part 4. Here we connect the data from parts 1-3 by matching geographic coordinates
+
+Part 5. Here we split the data into clusters to calculate haploptype and nucleotide diversity. We cluster the other data and add in environmental data to compare with the nucelotide and haplotype diversity metrics
+
+Part 6. Here we build the environmental (ie. climatic conditions) and geographic space for Colilargo as a whole
+
+Part 7. Here we load our suitability analysis that was conducted in Wallace to compare with our parasite, ANDV, and genetic data. We used Wallace - an R based shiny app- to conduct the suitability analysis. We calculate the various centroids here, including fundamental niche and realized niche from two different suitability analyses (one with the accepted distribution of O. longicaudatus and one using all data reported in Chile and Argentina).
+
+Part 8. Here is the code for statistical tests and final plots used in publication
+
+
+
+
+
+
+
+
